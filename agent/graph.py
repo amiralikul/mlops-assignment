@@ -16,6 +16,7 @@ conditional router following the same shape.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -81,6 +82,50 @@ def _extract_sql(text: str) -> str:
     return (fenced.group(1) if fenced else text).strip()
 
 
+def _parse_verify_reply(text: str) -> tuple[bool, str]:
+    """Parse the verifier's JSON reply, tolerating fences or surrounding prose."""
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    candidate = (fenced.group(1) if fenced else text).strip()
+
+    if not candidate.startswith("{"):
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = candidate[start:end + 1]
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as e:
+        return False, f"Could not parse verifier JSON: {e.msg}"
+
+    if not isinstance(parsed, dict):
+        return False, "Verifier JSON was not an object"
+
+    ok = parsed.get("ok")
+    issue = parsed.get("issue", "")
+    if not isinstance(ok, bool):
+        return False, "Verifier JSON missing boolean field 'ok'"
+    if not isinstance(issue, str):
+        issue = str(issue)
+    return ok, issue
+
+
+def _duplicate_rows_issue(execution: ExecutionResult | None, sql: str) -> str | None:
+    """Return an issue when the result repeats identical rows needlessly."""
+    if execution is None or not execution.ok or not execution.rows:
+        return None
+    if len(execution.rows) < 2:
+        return None
+    if len(set(execution.rows)) == len(execution.rows):
+        return None
+
+    normalized_sql = sql.lower()
+    if " distinct " in f" {normalized_sql} " or " group by " in normalized_sql:
+        return None
+
+    return "repeated identical rows; add DISTINCT or aggregate so each answer row is unique"
+
+
 def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
@@ -124,7 +169,42 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = (
+        state.execution.render()
+        if state.execution is not None
+        else "ERROR: SQL was not executed."
+    )
+    duplicate_issue = _duplicate_rows_issue(state.execution, state.sql)
+    if duplicate_issue:
+        return {
+            "verify_ok": False,
+            "verify_issue": duplicate_issue,
+            "history": state.history + [{
+                "node": "verify",
+                "ok": False,
+                "issue": duplicate_issue,
+            }],
+        }
+
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution=execution,
+        )),
+    ])
+    ok, issue = _parse_verify_reply(response.content)
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{
+            "node": "verify",
+            "ok": ok,
+            "issue": issue,
+        }],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +217,27 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution = (
+        state.execution.render()
+        if state.execution is not None
+        else "ERROR: SQL was not executed."
+    )
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution=execution,
+            issue=state.verify_issue,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{"node": "revise", "sql": sql}],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +246,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------

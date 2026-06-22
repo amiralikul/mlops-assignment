@@ -7,12 +7,14 @@ the PRAGMA introspection here or the SQL the model emits later.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DB_DIR = ROOT / "data" / "bird"
+TABLE_METADATA = DB_DIR / "dev_20240627" / "dev_tables.json"
 
 
 def db_path(db_id: str) -> Path:
@@ -25,12 +27,40 @@ def _q(ident: str) -> str:
 
 
 @lru_cache(maxsize=32)
+def _column_descriptions(db_id: str) -> dict[tuple[str, str], str]:
+    """Load BIRD's semantic column names keyed by original table/column names."""
+    if not TABLE_METADATA.exists():
+        return {}
+
+    for db in json.loads(TABLE_METADATA.read_text()):
+        if db.get("db_id") != db_id:
+            continue
+
+        table_names = db.get("table_names_original", [])
+        original_columns = db.get("column_names_original", [])
+        semantic_columns = db.get("column_names", [])
+        descriptions: dict[tuple[str, str], str] = {}
+
+        for original, semantic in zip(original_columns, semantic_columns, strict=False):
+            table_index, column_name = original
+            if table_index == -1:
+                continue
+            description = semantic[1]
+            if description != column_name:
+                descriptions[(table_names[table_index], column_name)] = description
+        return descriptions
+
+    return {}
+
+
+@lru_cache(maxsize=32)
 def render_schema(db_id: str) -> str:
     path = db_path(db_id)
     if not path.exists():
         raise FileNotFoundError(f"DB {db_id} not found at {path}. Did you run scripts/load_data.py?")
 
     parts: list[str] = [f"-- Database: {db_id}"]
+    descriptions = _column_descriptions(db_id)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
         tables = [
             r[0]
@@ -49,6 +79,9 @@ def render_schema(db_id: str) -> str:
                     line += " PRIMARY KEY"
                 if notnull and not pk:
                     line += " NOT NULL"
+                description = descriptions.get((t, name))
+                if description:
+                    line += f" -- {description}"
                 col_lines.append(line)
             for fk in conn.execute(f"PRAGMA foreign_key_list({_q(t)})"):
                 # (id, seq, ref_table, from, to, on_update, on_delete, match)
