@@ -118,6 +118,52 @@ class GraphNodeTests(unittest.TestCase):
         self.assertEqual(result["history"][-1]["node"], "verify")
         self.assertFalse(result["history"][-1]["ok"])
 
+    def test_verify_node_fast_mode_accepts_successful_execution_without_calling_llm(self) -> None:
+        state = AgentState(
+            question="List Ajax powers",
+            db_id="superhero",
+            schema='CREATE TABLE "superpower" ("power_name" TEXT);',
+            sql='SELECT "power_name" FROM "superpower";',
+            execution=ExecutionResult(
+                ok=True,
+                rows=[("Agility",)],
+                columns=["power_name"],
+                row_count=1,
+            ),
+            history=[{"node": "generate_sql", "sql": 'SELECT "power_name" FROM "superpower";'}],
+        )
+
+        with (
+            patch.dict("os.environ", {"AGENT_VERIFY_MODE": "fast"}),
+            patch("agent.graph.llm") as llm_factory,
+        ):
+            result = verify_node(state)
+
+        llm_factory.assert_not_called()
+        self.assertTrue(result["verify_ok"])
+        self.assertIn("fast verifier", result["verify_issue"])
+        self.assertTrue(result["history"][-1]["ok"])
+
+    def test_verify_node_fast_mode_rejects_execution_errors_without_calling_llm(self) -> None:
+        state = AgentState(
+            question="List Ajax powers",
+            db_id="superhero",
+            schema='CREATE TABLE "superpower" ("power_name" TEXT);',
+            sql='SELECT missing FROM "superpower";',
+            execution=ExecutionResult(ok=False, error="no such column: missing"),
+            history=[{"node": "generate_sql", "sql": 'SELECT missing FROM "superpower";'}],
+        )
+
+        with (
+            patch.dict("os.environ", {"AGENT_VERIFY_MODE": "fast"}),
+            patch("agent.graph.llm") as llm_factory,
+        ):
+            result = verify_node(state)
+
+        llm_factory.assert_not_called()
+        self.assertFalse(result["verify_ok"])
+        self.assertIn("SQL execution failed", result["verify_issue"])
+
 
 if __name__ == "__main__":
     unittest.main()

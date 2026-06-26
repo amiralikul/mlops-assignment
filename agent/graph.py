@@ -62,6 +62,7 @@ def llm() -> ChatOpenAI:
         base_url=VLLM_BASE_URL,
         api_key=LLM_API_KEY,
         temperature=0.0,
+        max_tokens=int(os.environ.get("VLLM_MAX_TOKENS", "192")),
     )
 
 
@@ -126,6 +127,23 @@ def _duplicate_rows_issue(execution: ExecutionResult | None, sql: str) -> str | 
     return "repeated identical rows; add DISTINCT or aggregate so each answer row is unique"
 
 
+def _fast_verify(state: AgentState) -> tuple[bool, str] | None:
+    """Cheap verifier for load tests: avoid a second LLM call on clean executions."""
+    if os.environ.get("AGENT_VERIFY_MODE", "llm").lower() != "fast":
+        return None
+
+    if state.execution is None:
+        return False, "SQL was not executed"
+    if not state.execution.ok:
+        return False, f"SQL execution failed: {state.execution.error}"
+
+    duplicate_issue = _duplicate_rows_issue(state.execution, state.sql)
+    if duplicate_issue:
+        return False, duplicate_issue
+
+    return True, "accepted by fast verifier after successful SQL execution"
+
+
 def generate_sql_node(state: AgentState) -> dict:
     """Worked example - the other LLM nodes follow this same shape.
 
@@ -183,6 +201,19 @@ def verify_node(state: AgentState) -> dict:
                 "node": "verify",
                 "ok": False,
                 "issue": duplicate_issue,
+            }],
+        }
+
+    fast_verdict = _fast_verify(state)
+    if fast_verdict is not None:
+        ok, issue = fast_verdict
+        return {
+            "verify_ok": ok,
+            "verify_issue": issue,
+            "history": state.history + [{
+                "node": "verify",
+                "ok": ok,
+                "issue": issue,
             }],
         }
 

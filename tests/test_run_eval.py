@@ -1,6 +1,10 @@
 import unittest
+import sqlite3
+import tempfile
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from agent.execution import execute_sql
 from evals import run_eval
 
 
@@ -104,6 +108,30 @@ class EvalRunnerTests(unittest.TestCase):
         self.assertEqual(summary["per_iteration"]["1"]["correct"], 1)
         self.assertEqual(summary["per_iteration"]["2"]["correct"], 2)
         self.assertEqual(summary["per_iteration"]["3"]["correct"], 2)
+
+
+class SqlExecutionTests(unittest.TestCase):
+    def test_execute_sql_interrupts_long_running_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "toy.sqlite"
+            sqlite3.connect(db).close()
+
+            with patch("agent.execution.db_path", return_value=db):
+                result = execute_sql(
+                    "toy",
+                    """
+                    WITH RECURSIVE cnt(x) AS (
+                      SELECT 1
+                      UNION ALL
+                      SELECT x + 1 FROM cnt WHERE x < 100000000
+                    )
+                    SELECT sum(x) FROM cnt;
+                    """,
+                    timeout_seconds=0.001,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("interrupted", result.error or "")
 
 
 def httpx_error(message: str) -> RuntimeError:

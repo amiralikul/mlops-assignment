@@ -74,9 +74,9 @@ Current startup configuration to validate:
 |---|---:|---|
 | `--model` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | Fixed assignment model. |
 | `--host` / `--port` | `0.0.0.0` / `8000` | Exposes an OpenAI-compatible endpoint for the agent and manual checks. |
-| `--max-model-len` | `4096` | Enough for 1.5K-3K token schema/question prompts plus short outputs; avoids wasting KV cache on the model's 262K default context. |
-| `--max-num-seqs` | TBD | Controls concurrency; tune against KV cache headroom and queueing. |
-| `--max-num-batched-tokens` | `4096` initial | Main prefill batching lever; start near expected prompt size to reduce fat prefill steps and tune for P95 TTFT. |
+| `--max-model-len` | `8192` | Avoids the observed 4096-token context failures for larger BIRD schemas while staying far below the model's 262K default. |
+| `--max-num-seqs` | `64` | Allows enough concurrent short SQL generations for 10 RPS without letting the queue grow unbounded. |
+| `--max-num-batched-tokens` | `8192` | Matches the tuned context window so long schema prompts can prefill without rejection. |
 | `--enable-prefix-caching` | enabled | Reuses common prompt/schema prefixes when possible. |
 | chunked prefill | enabled by vLLM | Helps prevent long prefills from blocking decode steps under bursty load. |
 
@@ -87,12 +87,13 @@ uv run python -m vllm.entrypoints.openai.api_server \
   --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
   --host 0.0.0.0 \
   --port 8000 \
-  --max-model-len 4096 \
-  --max-num-batched-tokens 4096 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 8192 \
+  --max-num-seqs 64 \
   --enable-prefix-caching
 ```
 
-Required artifact still pending: `screenshots/vllm_manual_query.png`.
+Available artifact: `screenshots/vllm_manual_query.png`.
 
 ## Phase 2: Serving Observability
 
@@ -160,12 +161,6 @@ The dashboard should answer three questions:
 Available artifact:
 
 - `screenshots/grafana_serving.png`
-
-Required artifacts still pending:
-
-- `screenshots/grafana_eval_run.png`
-- `screenshots/grafana_before.png`
-- `screenshots/grafana_after.png`
 
 ## Phase 3: Agent Design
 
@@ -314,14 +309,11 @@ schema grounding can still improve.
 Available artifact:
 
 - `results/eval_baseline.json`
-
-Required artifact still pending:
-
 - `screenshots/grafana_eval_run.png`
 
 ## Phase 6: SLO Diagnosis
 
-Status: pending H100 load testing.
+Status: tuned configuration hit the latency target with clean request success.
 
 The target is:
 
@@ -329,19 +321,116 @@ The target is:
 P95 end-to-end agent latency < 5s at 10+ RPS over 5 minutes
 ```
 
-The final report should include:
+Baseline load test command:
 
-- baseline load-test numbers,
-- whether the target was hit,
-- one or more metric-grounded tuning iterations,
-- before/after Grafana screenshots,
-- `results/eval_after_tuning.json` to show whether quality survived tuning.
+```bash
+uv run python load_test/driver.py --rps 10 --duration 300 --out results/load_baseline.json
+```
 
-Iteration log template:
+Baseline result:
+
+| Metric | Value |
+|---|---:|
+| Requested RPS | 10.0 |
+| Duration | 300s |
+| Wall clock | 360.0s |
+| Total requests | 3000 |
+| Achieved RPS | 8.33 |
+| OK | 673 |
+| Timeouts | 1546 |
+| HTTP errors | 323 |
+| Client errors | 458 |
+| Latency P50 | 68.69s |
+| Latency P95 | 119.81s |
+| Latency P99 | 120.51s |
+| Max latency | 120.94s |
+
+The baseline did not hit the SLO. The system could not sustain the offered 10
+agent runs per second: most requests failed or timed out, and P95 latency was
+close to the 120s client timeout. This pointed to queue saturation plus request
+failure, not a small tail-latency miss.
+
+Tuning iteration log:
 
 ```text
-saw <metric symptom> -> hypothesized <cause> -> changed <one config/prompt lever> -> result was <measured change>
+saw 2-3 LLM calls per agent run and vLLM/agent queues saturating
+-> hypothesized verifier LLM calls were the biggest avoidable latency multiplier
+-> added AGENT_VERIFY_MODE=fast, which accepts successful non-duplicate SQL
+   executions without calling the LLM verifier
+-> 60s smoke improved to 600/600 OK with P95 2.33s
 ```
+
+```text
+saw HTTP 500s during load and vLLM logs showing prompts slightly above 4096 tokens
+-> hypothesized some DB schemas exceeded the configured context window
+-> increased vLLM max context from 4096 to 8192 and set max_num_batched_tokens to
+   8192, with max_num_seqs=64
+-> context-length failures disappeared
+```
+
+```text
+saw remaining HTTP 500s for european_football_2 and debit_card_specializing
+-> traced root cause to schema rendering of SQLite foreign keys with NULL target
+   columns and NULL BIRD metadata descriptions
+-> skipped malformed FK targets and ignored NULL descriptions
+-> 120-request reproduction went from repeated 500s to 120/120 OK
+```
+
+```text
+saw a few long-tail timeouts with no vLLM errors
+-> hypothesized generated SQL could run too long because sqlite3 timeout only
+   covers lock waits, not query execution time
+-> added a SQLite progress handler to interrupt queries after the execution
+   budget
+-> final 5-minute run completed 3000/3000 OK with P95 2.15s
+```
+
+Final load test command:
+
+```bash
+uv run python load_test/driver.py --rps 10 --duration 300 --out results/load_tuned_timeout_final.json
+```
+
+Final load test result:
+
+| Metric | Value |
+|---|---:|
+| Requested RPS | 10.0 |
+| Duration | 300s |
+| Wall clock | 301.1s |
+| Total requests | 3000 |
+| Achieved RPS | 9.96 |
+| OK | 3000 |
+| Timeouts | 0 |
+| HTTP errors | 0 |
+| Client errors | 0 |
+| Latency P50 | 0.85s |
+| Latency P95 | 2.15s |
+| Latency P99 | 6.01s |
+| Max latency | 23.19s |
+
+The final run met the latency target and served the offered 3000 requests over
+the 5-minute window without errors. The reported achieved RPS is 9.96 because
+the driver includes about 1s of startup/drain overhead in wall-clock time; the
+offered load was 10 RPS for 300s.
+
+Post-tuning eval quality survived:
+
+| Metric | Baseline | Tuned |
+|---|---:|---:|
+| Execution accuracy | 46.7% | 46.7% |
+| Correct | 14 / 30 | 14 / 30 |
+| Average iterations | 1.53 | 1.13 |
+| Eval latency P50 | 1.01s | 0.55s |
+| Eval latency P95 | 2.74s | 1.33s |
+
+Available artifacts:
+
+- `results/load_baseline.json`
+- `results/load_tuned_timeout_final.json`
+- `results/eval_after_tuning.json`
+- `screenshots/grafana_before.png`
+- `screenshots/grafana_after.png`
 
 ## Agent Value
 
@@ -352,10 +441,13 @@ matched the expected unique coordinate row. This is exactly the intended
 architecture: generation can be imperfect, execution exposes concrete behavior,
 and verification/revision can repair the served answer.
 
-The final quantitative claim should come from Phase 5 per-iteration pass rates.
-If pass rate after revision is higher than pass rate after the first generation,
-the loop is earning its extra latency. If not, the report should say that the
-architecture did not pay for itself yet.
+The final eval supports that claim quantitatively. First-generation SQL was
+correct on 12/30 questions (40.0%). After verification and revision, final
+accuracy reached 14/30 (46.7%). The two extra correct answers came from cases
+where execution feedback exposed a concrete issue that could be repaired. After
+the fast verifier tuning, this did not require paying an LLM-verifier call on
+every clean execution: average iterations dropped from 1.53 to 1.13, eval P95
+latency dropped from 2.74s to 1.33s, and final accuracy stayed at 46.7%.
 
 ## What I Would Do With More Time
 

@@ -46,7 +46,7 @@ def _column_descriptions(db_id: str) -> dict[tuple[str, str], str]:
             if table_index == -1:
                 continue
             description = semantic[1]
-            if description != column_name:
+            if isinstance(description, str) and description != column_name:
                 descriptions[(table_names[table_index], column_name)] = description
         return descriptions
 
@@ -85,9 +85,15 @@ def render_schema(db_id: str) -> str:
                 col_lines.append(line)
             for fk in conn.execute(f"PRAGMA foreign_key_list({_q(t)})"):
                 # (id, seq, ref_table, from, to, on_update, on_delete, match)
-                col_lines.append(
-                    f"  FOREIGN KEY ({_q(fk[3])}) REFERENCES {_q(fk[2])}({_q(fk[4])})"
-                )
+                from_col = fk[3]
+                ref_table = fk[2]
+                to_col = fk[4]
+                if not from_col or not ref_table:
+                    continue
+                reference = f"  FOREIGN KEY ({_q(from_col)}) REFERENCES {_q(ref_table)}"
+                if to_col:
+                    reference += f"({_q(to_col)})"
+                col_lines.append(reference)
             parts.append(",\n".join(col_lines))
             parts.append(");")
     return "\n".join(parts)

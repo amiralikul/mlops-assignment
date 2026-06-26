@@ -7,6 +7,7 @@ to decide whether the answer looks plausible.
 from __future__ import annotations
 
 import sqlite3
+import time
 from dataclasses import dataclass
 
 from agent.schema import db_path
@@ -43,6 +44,12 @@ def execute_sql(db_id: str, sql: str, timeout_seconds: float = 5.0) -> Execution
             uri=True,
             timeout=timeout_seconds,
         ) as conn:
+            deadline = time.monotonic() + timeout_seconds
+
+            def abort_when_expired() -> int:
+                return int(time.monotonic() > deadline)
+
+            conn.set_progress_handler(abort_when_expired, 1000)
             cur = conn.execute(sql)
             cols = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchall()
