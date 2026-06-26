@@ -6,6 +6,7 @@ Run:
 The /answer endpoint accepts {question, db, tags?} and returns the
 agent's final SQL, the result rows, and per-iteration history.
 """
+
 from __future__ import annotations
 
 import os
@@ -30,6 +31,16 @@ if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY
 
 
 app = FastAPI()
+
+
+def build_trace_metadata(tags: dict[str, str]) -> dict[str, str]:
+    return {
+        "backend": "vllm",
+        "model": os.environ.get("VLLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507"),
+        "run_type": "manual",
+        "tuning_iteration": "baseline",
+        **tags,
+    }
 
 
 class AnswerRequest(BaseModel):
@@ -57,7 +68,7 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     state = AgentState(question=req.question, db_id=req.db)
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
+        "metadata": build_trace_metadata(req.tags),
     }
     try:
         final = graph.invoke(state, config=config)

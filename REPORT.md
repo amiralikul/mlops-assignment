@@ -2,18 +2,65 @@
 
 ## Scope and Current Status
 
-This report currently documents the parts validated without the final H100-hosted
-vLLM run. Agent development and tracing were tested locally against Nebius Token
-Factory, which exposes an OpenAI-compatible API. Final serving configuration,
-Grafana metrics, eval pass rates, and SLO claims must still be collected against
-`Qwen/Qwen3-30B-A3B-Instruct-2507` served by vLLM on one H100.
+This report currently documents the parts validated locally plus the H100
+bring-up work completed so far. Agent development and tracing were first tested
+locally against Nebius Token Factory, which exposes an OpenAI-compatible API.
+The H100 VM is now reachable over SSH and vLLM startup has progressed through
+model download/loading, but final Grafana metrics, eval pass rates, and SLO
+claims still need to be collected after vLLM is serving successfully.
 
 ## Phase 1: vLLM Serving Configuration
 
-Status: pending H100 validation.
+Status: H100 bring-up in progress.
 
-The final report should be filled from the actual vLLM command used on the H100.
-The initial configuration should be chosen around this workload:
+The H100 VM was created on Nebius with:
+
+- `NVIDIA H100 80GB HBM3` / `NVIDIA H100 NVLink`,
+- 16 vCPUs,
+- 200 GiB RAM,
+- 1.28 TiB boot disk,
+- Ubuntu 24.04 LTS for NVIDIA GPUs.
+
+SSH access required two fixes:
+
+- attach a public IPv4 address to the VM,
+- use the username from cloud-init user data (`amir`) and the matching local
+  private key (`~/.ssh/github_work`).
+
+The working SSH command with assignment port forwarding is:
+
+```bash
+ssh -i ~/.ssh/github_work \
+  -L 3000:localhost:3000 \
+  -L 9090:localhost:9090 \
+  -L 3001:localhost:3001 \
+  -L 8000:localhost:8000 \
+  -L 8001:localhost:8001 \
+  amir@89.169.124.184
+```
+
+On the VM, GPU and base tooling were verified:
+
+- `nvidia-smi` showed one idle H100 80GB,
+- Docker and Docker Compose were installed,
+- Python 3.12 and git were installed,
+- `uv` was installed under `~/.local/bin`.
+
+The first vLLM startup attempts exposed three setup/configuration issues:
+
+1. `Qwen2Tokenizer has no attribute all_special_tokens_extended`
+   - Cause: `transformers==5.9.0` was installed with `vllm==0.10.2`.
+   - Fix: pin/install `transformers<5`.
+2. `fatal error: Python.h: No such file or directory`
+   - Cause: Triton/Torch compile path needs Python development headers.
+   - Fix: `sudo apt install -y python3-dev build-essential`.
+3. KV cache startup failure with Qwen's default `max_model_len=262144`
+   - Cause: vLLM needed 24 GiB of KV cache to serve one max-length request, but
+     only 8.68 GiB was available after loading the 30B MoE weights.
+   - Fix: reduce context length for this workload, starting with
+     `--max-model-len 4096`.
+
+The initial serving configuration is chosen around this workload:
 
 - prompts are roughly 1.5K-3K tokens,
 - outputs are short SQL or JSON snippets,
@@ -21,26 +68,88 @@ The initial configuration should be chosen around this workload:
 - the target SLO is P95 end-to-end agent latency under 5 seconds at 10+ RPS over
   a 5-minute window.
 
-Planned configuration fields to report:
+Current startup configuration to validate:
 
 | Flag | Value | Reason |
 |---|---:|---|
 | `--model` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | Fixed assignment model. |
 | `--host` / `--port` | `0.0.0.0` / `8000` | Exposes an OpenAI-compatible endpoint for the agent and manual checks. |
-| `--max-model-len` | TBD | Should be large enough for schema + question prompts without wasting KV cache. |
+| `--max-model-len` | `4096` | Enough for 1.5K-3K token schema/question prompts plus short outputs; avoids wasting KV cache on the model's 262K default context. |
 | `--max-num-seqs` | TBD | Controls concurrency; tune against KV cache headroom and queueing. |
-| `--max-num-batched-tokens` | TBD | Main prefill batching lever; tune for P95 TTFT rather than only throughput. |
-| `--enable-chunked-prefill` | TBD | Expected to help tail latency for 1.5K-3K token prompts under bursty load. |
+| `--max-num-batched-tokens` | `4096` initial | Main prefill batching lever; start near expected prompt size to reduce fat prefill steps and tune for P95 TTFT. |
+| `--enable-prefix-caching` | enabled | Reuses common prompt/schema prefixes when possible. |
+| chunked prefill | enabled by vLLM | Helps prevent long prefills from blocking decode steps under bursty load. |
+
+The intended command shape is:
+
+```bash
+uv run python -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-30B-A3B-Instruct-2507 \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --max-model-len 4096 \
+  --max-num-batched-tokens 4096 \
+  --enable-prefix-caching
+```
 
 Required artifact still pending: `screenshots/vllm_manual_query.png`.
 
 ## Phase 2: Serving Observability
 
-Status: pending real vLLM metrics.
+Status: H100 vLLM metrics are available and the Grafana dashboard has been
+expanded beyond the starter panels.
 
 Token Factory was useful for agent development, but it does not expose this
-assignment's vLLM `/metrics` endpoint. The Grafana dashboard and final serving
-screenshots should therefore be completed against the H100 vLLM process.
+assignment's vLLM `/metrics` endpoint. The serving dashboard was therefore
+validated against the H100 vLLM process on the Nebius VM.
+
+Locally, the provisioned Grafana dashboard was found at:
+
+```text
+http://localhost:3000/d/vllm-serving/vllm-serving
+```
+
+The first local check, before vLLM was running on port `8000`, showed Prometheus
+scraping the configured target but receiving connection refused:
+
+```text
+job: vllm
+scrapeUrl: http://host.docker.internal:8000/metrics
+health: down
+error: connection refused
+```
+
+This confirmed that the dashboard/provisioning path was correct. After starting
+vLLM on the H100 VM, `/metrics` exposed the expected counters, gauges, and
+histograms, including:
+
+- `vllm:num_requests_running`
+- `vllm:num_requests_waiting`
+- `vllm:request_success_total`
+- `vllm:prompt_tokens_total`
+- `vllm:generation_tokens_total`
+- `vllm:e2e_request_latency_seconds_bucket`
+- `vllm:time_to_first_token_seconds_bucket`
+- `vllm:inter_token_latency_seconds_bucket`
+- `vllm:request_queue_time_seconds_bucket`
+- `vllm:request_prefill_time_seconds_bucket`
+- `vllm:request_decode_time_seconds_bucket`
+- `vllm:kv_cache_usage_perc`
+
+The dashboard was expanded to cover:
+
+- request concurrency and queueing,
+- request throughput by finish reason,
+- prompt and generation token throughput,
+- p50/p95/p99 end-to-end latency,
+- p95 queue, prefill, decode, and inference time,
+- p50/p95 time to first token,
+- p50/p95 inter-token latency,
+- KV cache usage,
+- prefix cache hit ratio,
+- preemptions,
+- prompt/generation token distribution,
+- engine step token distribution.
 
 The dashboard should answer three questions:
 
@@ -48,9 +157,12 @@ The dashboard should answer three questions:
 - Throughput: how many requests and generated tokens are being served?
 - KV cache: is there enough cache headroom for the current concurrency?
 
-Required artifacts still pending:
+Available artifact:
 
 - `screenshots/grafana_serving.png`
+
+Required artifacts still pending:
+
 - `screenshots/grafana_eval_run.png`
 - `screenshots/grafana_before.png`
 - `screenshots/grafana_after.png`
@@ -140,23 +252,72 @@ Pending artifact:
 For Phase 6, traces should be sent with metadata tags such as backend, model,
 run type, and tuning iteration so slow requests can be filtered by experiment.
 
+On the H100 VM, Langfuse keys were added to `.env` with `LANGFUSE_HOST` pointing
+at the locally forwarded Langfuse service:
+
+```env
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_HOST=http://localhost:3001
+```
+
+The agent server should be restarted after `.env` changes so the callback handler
+is initialized with the new keys.
+
 ## Phase 5: Offline Evals
 
-Status: pending implementation.
+Status: implemented and run against the H100 vLLM-backed agent.
 
-`evals/run_eval.py` still needs the Phase 5 implementation. The eval should:
+`evals/run_eval.py` now:
 
-- read `evals/eval_set.jsonl`,
-- call `http://localhost:8001/answer`,
-- execute both predicted SQL and gold SQL against the target SQLite DB,
-- canonicalize result rows before comparison,
-- report overall execution accuracy,
-- report per-iteration pass rates to measure whether the verify/revise loop adds
-  value,
-- write `results/eval_baseline.json`.
+- reads `evals/eval_set.jsonl`,
+- calls `http://localhost:8001/answer`,
+- executes both predicted SQL and gold SQL against the target SQLite DB,
+- canonicalizes result rows before comparison,
+- scores the final answer and each generated/revised SQL attempt from the
+  agent history,
+- reports overall execution accuracy,
+- reports per-iteration pass rates with carry-forward for stopped runs,
+- writes `results/eval_baseline.json`.
 
-Final pass rates should be reported from the real Qwen3-30B-A3B vLLM backend on
-the H100, not from Token Factory development runs.
+Baseline eval command:
+
+```bash
+uv run python evals/run_eval.py --out results/eval_baseline.json
+```
+
+Baseline eval results:
+
+| Metric | Value |
+|---|---:|
+| Questions | 30 |
+| Correct | 14 |
+| Execution accuracy | 46.7% |
+| Errors | 0 |
+| Average iterations | 1.53 |
+| Agent latency P50 | 1.01s |
+| Agent latency P95 | 2.74s |
+
+Per-iteration carry-forward pass rate:
+
+| Iteration | Correct | Accuracy |
+|---:|---:|---:|
+| 1 | 11 / 30 | 36.7% |
+| 2 | 12 / 30 | 40.0% |
+| 3 | 14 / 30 | 46.7% |
+
+The verify/revise loop improved the eval score from 36.7% at the first SQL
+attempt to 46.7% by the final served answer. That is a meaningful gain, so the
+loop is doing useful work, although the remaining failures show that prompt and
+schema grounding can still improve.
+
+Available artifact:
+
+- `results/eval_baseline.json`
+
+Required artifact still pending:
+
+- `screenshots/grafana_eval_run.png`
 
 ## Phase 6: SLO Diagnosis
 

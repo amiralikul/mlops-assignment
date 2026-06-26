@@ -11,9 +11,21 @@ from agent.graph import (
     route_after_verify,
     verify_node,
 )
+from agent.server import build_trace_metadata
 
 
 class GraphNodeTests(unittest.TestCase):
+    def test_build_trace_metadata_adds_report_defaults_and_preserves_request_tags(
+        self,
+    ) -> None:
+        metadata = build_trace_metadata({"run_type": "eval", "db": "financial"})
+
+        self.assertEqual(metadata["backend"], "vllm")
+        self.assertEqual(metadata["model"], "Qwen/Qwen3-30B-A3B-Instruct-2507")
+        self.assertEqual(metadata["run_type"], "eval")
+        self.assertEqual(metadata["tuning_iteration"], "baseline")
+        self.assertEqual(metadata["db"], "financial")
+
     def test_parse_verify_reply_extracts_fenced_json(self) -> None:
         ok, issue = _parse_verify_reply(
             '```json\n{"ok": false, "issue": "SQL errored"}\n```'
@@ -37,7 +49,9 @@ class GraphNodeTests(unittest.TestCase):
         self.assertIn("Could not parse verifier JSON", issue)
 
     def test_route_after_verify_ends_when_ok_or_at_iteration_cap(self) -> None:
-        self.assertEqual(route_after_verify(AgentState("q", "db", verify_ok=True)), "end")
+        self.assertEqual(
+            route_after_verify(AgentState("q", "db", verify_ok=True)), "end"
+        )
         self.assertEqual(
             route_after_verify(
                 AgentState("q", "db", verify_ok=False, iteration=MAX_ITERATIONS)
@@ -87,7 +101,12 @@ class GraphNodeTests(unittest.TestCase):
                 columns=["lat", "lng"],
                 row_count=2,
             ),
-            history=[{"node": "generate_sql", "sql": 'SELECT c."lat", c."lng" FROM "circuits" c;'}],
+            history=[
+                {
+                    "node": "generate_sql",
+                    "sql": 'SELECT c."lat", c."lng" FROM "circuits" c;',
+                }
+            ],
         )
 
         with patch("agent.graph.llm") as llm_factory:
